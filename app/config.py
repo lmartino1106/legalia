@@ -29,6 +29,9 @@ class Settings(BaseSettings):
     # Embeddings
     openai_api_key: str = ""
 
+    # Scraping
+    firecrawl_api_key: str = ""
+
     # Vector DB
     qdrant_url: str = "http://localhost:6333"
     qdrant_api_key: str = ""

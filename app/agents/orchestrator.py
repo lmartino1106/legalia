@@ -1,8 +1,9 @@
-"""Orquestador principal — clasifica, genera respuesta, aplica guardrails."""
+"""Orquestador principal — clasifica, genera respuesta con RAG, aplica guardrails."""
 import logging
 import json
 from anthropic import Anthropic
 from app.config import get_settings
+from app.rag.laws.retriever import search_laws, format_context_for_llm
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +47,8 @@ Responde SIEMPRE en formato JSON con esta estructura:
 CONTEXT_PROMPT = """Historial de la conversación:
 {history}
 
+{rag_context}
+
 Consulta actual del usuario:
 {query}"""
 
@@ -72,8 +75,19 @@ class LegalOrchestrator:
                 role = "Usuario" if msg["role"] == "user" else "LegalIA"
                 history_text += f"{role}: {msg['content']}\n"
 
+        # RAG: buscar artículos relevantes
+        rag_context = ""
+        try:
+            articles = await search_laws(query, top_k=5)
+            if articles:
+                rag_context = format_context_for_llm(articles)
+                logger.info(f"RAG: {len(articles)} artículos inyectados al contexto")
+        except Exception as e:
+            logger.warning(f"RAG search falló, continuando sin contexto: {e}")
+
         user_content = CONTEXT_PROMPT.format(
             history=history_text or "(primera consulta)",
+            rag_context=rag_context or "(sin artículos recuperados — responde con tu conocimiento general)",
             query=query,
         )
 
