@@ -80,7 +80,7 @@ async def save_message(
         msg["citations"] = citations
     if area_detected:
         msg["area_detected"] = area_detected
-    if confidence_score:
+    if confidence_score is not None:
         msg["confidence_score"] = confidence_score
 
     result = db.table("messages").insert(msg).execute()
@@ -168,3 +168,45 @@ async def save_feedback(
     }
     result = db.table("feedback").insert(feedback).execute()
     return result.data[0]
+
+
+async def save_analytics_event(
+    event_type: str,
+    event_data: dict,
+    user_id: str | None = None,
+    area_legal: str | None = None,
+    rag_used: str | None = None,
+    session_id: str | None = None,
+) -> dict | None:
+    """Guarda un evento de analytics en la tabla analytics_events.
+
+    Args:
+        event_type: Tipo de evento (query, feedback, upgrade, referral, error)
+        event_data: Datos del evento (métricas CAS/FJI, latencia, etc.)
+        user_id: ID del usuario (opcional)
+        area_legal: Área legal detectada (opcional)
+        rag_used: Tipo de RAG usado (laws, documents, training, multi)
+        session_id: ID de sesión (opcional)
+    """
+    db = get_supabase()
+
+    event = {
+        "event_type": event_type,
+        "event_data": event_data,
+    }
+    if user_id:
+        event["user_id"] = user_id
+    if area_legal:
+        event["area_legal"] = area_legal
+    if rag_used:
+        event["rag_used"] = rag_used
+    if session_id:
+        event["session_id"] = session_id
+
+    try:
+        result = db.table("analytics_events").insert(event).execute()
+        logger.info(f"Analytics event saved: {event_type}")
+        return result.data[0] if result.data else None
+    except Exception as e:
+        logger.warning(f"Error guardando analytics event: {e}")
+        return None

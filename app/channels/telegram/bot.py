@@ -8,7 +8,7 @@ from telegram.ext import (
     filters,
 )
 from app.config import get_settings
-from app.db import get_or_create_user, save_message, get_conversation_history
+from app.db import get_or_create_user, save_message, get_conversation_history, save_analytics_event
 from app.agents.orchestrator import LegalOrchestrator, format_response_telegram
 
 logger = logging.getLogger(__name__)
@@ -132,15 +132,37 @@ async def handle_message(update: Update, context) -> None:
 
         sent = await update.message.reply_text(fallback)
 
-    # Guardar respuesta en DB
+    # Guardar respuesta en DB con confidence_score real
+    confidence = result.get("confidence_score", 0.0)
     await save_message(
         user_id=db_user["id"],
         role="assistant",
         content=result.get("respuesta", ""),
         channel="telegram",
         area_detected=result.get("area_legal"),
-        confidence_score=0.0,
+        confidence_score=confidence,
         citations=[{"ley": l} for l in result.get("leyes_relevantes", [])],
+    )
+
+    # Loguear métricas a analytics_events
+    verification = result.get("verification", {})
+    await save_analytics_event(
+        event_type="query",
+        event_data={
+            "cas_score": verification.get("cas_score", 0.0),
+            "fji_score": verification.get("fji_score", 0.0),
+            "confidence_score": confidence,
+            "articles_retrieved": result.get("articles_retrieved", 0),
+            "latency_ms": result.get("latency_ms", 0),
+            "tokens_used": result.get("tokens_used", 0),
+            "model": result.get("model", ""),
+            "fabricated_citations": verification.get("fabricated_citations", []),
+            "low_confidence_warning": result.get("low_confidence_warning", False),
+            "query_preview": text[:100],
+        },
+        user_id=db_user["id"],
+        area_legal=result.get("area_legal"),
+        rag_used="laws",
     )
 
     # Botones de feedback

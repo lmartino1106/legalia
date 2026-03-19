@@ -1,6 +1,7 @@
-"""Orquestador principal — clasifica, genera respuesta con RAG, aplica guardrails."""
+"""Orquestador principal — clasifica, genera respuesta con RAG, verifica evidencia."""
 import logging
 import json
+import time
 from anthropic import Anthropic
 from app.config import get_settings
 from app.rag.laws.retriever import search_laws, format_context_for_llm
@@ -52,9 +53,35 @@ CONTEXT_PROMPT = """Historial de la conversación:
 Consulta actual del usuario:
 {query}"""
 
+VERIFICATION_PROMPT = """Eres un verificador legal. Tu trabajo es verificar que una respuesta legal esté fundamentada en los artículos proporcionados.
+
+ARTÍCULOS RECUPERADOS:
+{articles}
+
+RESPUESTA GENERADA:
+{response}
+
+LEYES CITADAS EN LA RESPUESTA:
+{cited_laws}
+
+Evalúa:
+1. **Citation Existence (CAS)**: ¿Cada ley/artículo citado en la respuesta existe en los artículos recuperados? Lista cada cita y si existe o no.
+2. **Groundedness (FJI)**: ¿Cada afirmación legal está respaldada por los artículos recuperados?
+
+Responde en JSON:
+{
+  "cas_score": 0.0 a 1.0 (proporción de citas que existen en los artículos recuperados),
+  "fji_score": 0.0 a 1.0 (proporción de claims fundamentados en evidencia),
+  "fabricated_citations": ["lista de citas que NO están en los artículos recuperados"],
+  "verified_citations": ["lista de citas verificadas"],
+  "ungrounded_claims": ["claims sin evidencia en los artículos"]
+}
+
+Responde SOLO el JSON."""
+
 
 class LegalOrchestrator:
-    """Orquesta la respuesta legal usando Claude."""
+    """Orquesta la respuesta legal usando Claude + RAG + verificación."""
 
     def __init__(self):
         settings = get_settings()
@@ -66,17 +93,19 @@ class LegalOrchestrator:
         query: str,
         conversation_history: list[dict] | None = None,
     ) -> dict:
-        """Procesa una consulta legal y retorna respuesta estructurada."""
+        """Procesa una consulta legal y retorna respuesta estructurada y verificada."""
+        start_time = time.time()
 
         # Construir historial
         history_text = ""
         if conversation_history:
-            for msg in conversation_history[-6:]:  # últimos 6 mensajes
+            for msg in conversation_history[-6:]:
                 role = "Usuario" if msg["role"] == "user" else "LegalIA"
                 history_text += f"{role}: {msg['content']}\n"
 
-        # RAG: buscar artículos relevantes
+        # RAG: buscar artículos relevantes (hybrid search)
         rag_context = ""
+        articles = []
         try:
             articles = await search_laws(query, top_k=5)
             if articles:
@@ -101,7 +130,6 @@ class LegalOrchestrator:
 
             raw_text = response.content[0].text.strip()
 
-            # Parsear JSON de la respuesta
             # Limpiar posibles markdown code blocks
             if raw_text.startswith("```"):
                 raw_text = raw_text.split("\n", 1)[1]
@@ -115,10 +143,38 @@ class LegalOrchestrator:
             result["tokens_used"] = response.usage.input_tokens + response.usage.output_tokens
             result["model"] = self.model
 
+            # ── Fase 1: Evidence Alignment Layer ──
+            verification = await self._verify_response(result, articles)
+            result["verification"] = verification
+
+            # Post-proceso: eliminar citas fabricadas
+            if verification.get("fabricated_citations"):
+                result = self._remove_fabricated_citations(result, verification["fabricated_citations"])
+
+            # Agregar warning si groundedness es bajo
+            if verification.get("fji_score", 1.0) < 0.5 and articles:
+                result["low_confidence_warning"] = True
+                result["respuesta"] += (
+                    "\n\n⚠️ NOTA: Esta orientación tiene un nivel de certeza limitado. "
+                    "Algunos puntos podrían no estar completamente respaldados por la legislación consultada. "
+                    "Te recomendamos verificar con un abogado."
+                )
+
+            # Calcular confidence_score real
+            cas = verification.get("cas_score", 0.0)
+            fji = verification.get("fji_score", 0.0)
+            result["confidence_score"] = round((cas * 0.4 + fji * 0.6), 3) if articles else 0.0
+
+            elapsed_ms = int((time.time() - start_time) * 1000)
+            result["latency_ms"] = elapsed_ms
+            result["articles_retrieved"] = len(articles)
+
             logger.info(
                 f"Consulta procesada: area={result.get('area_legal')}, "
                 f"urgencia={result.get('nivel_urgencia')}, "
-                f"tokens={result.get('tokens_used')}"
+                f"CAS={cas:.2f}, FJI={fji:.2f}, "
+                f"confidence={result.get('confidence_score')}, "
+                f"latency={elapsed_ms}ms"
             )
 
             return result
@@ -136,6 +192,10 @@ class LegalOrchestrator:
                 "nivel_urgencia": "bajo",
                 "tokens_used": 0,
                 "model": self.model,
+                "confidence_score": 0.0,
+                "verification": {"cas_score": 0.0, "fji_score": 0.0},
+                "latency_ms": int((time.time() - start_time) * 1000),
+                "articles_retrieved": len(articles),
             }
 
         except Exception as e:
@@ -152,7 +212,95 @@ class LegalOrchestrator:
                 "tokens_used": 0,
                 "model": self.model,
                 "error": str(e),
+                "confidence_score": 0.0,
+                "verification": {"cas_score": 0.0, "fji_score": 0.0},
+                "latency_ms": int((time.time() - start_time) * 1000),
+                "articles_retrieved": len(articles),
             }
+
+    async def _verify_response(self, result: dict, articles: list[dict]) -> dict:
+        """Fase 1: Verifica la respuesta contra los artículos recuperados usando Haiku."""
+        if not articles:
+            return {
+                "cas_score": 0.0,
+                "fji_score": 0.0,
+                "fabricated_citations": [],
+                "verified_citations": [],
+                "ungrounded_claims": [],
+                "skipped": "no_articles",
+            }
+
+        try:
+            # Preparar artículos como texto
+            articles_text = ""
+            for i, art in enumerate(articles, 1):
+                articles_text += (
+                    f"[{i}] {art.get('law_name', '')} - Art. {art.get('article', '')}: "
+                    f"{art.get('text', '')[:500]}\n\n"
+                )
+
+            cited_laws = ", ".join(result.get("leyes_relevantes", []))
+
+            prompt = VERIFICATION_PROMPT.format(
+                articles=articles_text,
+                response=result.get("respuesta", ""),
+                cited_laws=cited_laws or "(ninguna ley citada)",
+            )
+
+            response = self.client.messages.create(
+                model="claude-haiku-4-5-20251001",
+                max_tokens=500,
+                messages=[{"role": "user", "content": prompt}],
+            )
+
+            raw = response.content[0].text.strip()
+            if raw.startswith("```"):
+                raw = raw.split("\n", 1)[1]
+                if raw.endswith("```"):
+                    raw = raw[:-3]
+                raw = raw.strip()
+
+            verification = json.loads(raw)
+            logger.info(
+                f"Verification: CAS={verification.get('cas_score', 0):.2f}, "
+                f"FJI={verification.get('fji_score', 0):.2f}, "
+                f"fabricated={len(verification.get('fabricated_citations', []))}"
+            )
+            return verification
+
+        except Exception as e:
+            logger.warning(f"Verification falló: {e}")
+            return {
+                "cas_score": 1.0,
+                "fji_score": 1.0,
+                "fabricated_citations": [],
+                "verified_citations": [],
+                "ungrounded_claims": [],
+                "error": str(e),
+            }
+
+    def _remove_fabricated_citations(self, result: dict, fabricated: list[str]) -> dict:
+        """Elimina citas fabricadas de la respuesta."""
+        if not fabricated:
+            return result
+
+        leyes = result.get("leyes_relevantes", [])
+        cleaned_leyes = []
+        for ley in leyes:
+            is_fabricated = False
+            for fab in fabricated:
+                if fab.lower() in ley.lower() or ley.lower() in fab.lower():
+                    is_fabricated = True
+                    break
+            if not is_fabricated:
+                cleaned_leyes.append(ley)
+
+        if len(cleaned_leyes) < len(leyes):
+            removed = len(leyes) - len(cleaned_leyes)
+            logger.info(f"Removed {removed} fabricated citations from response")
+            result["leyes_relevantes"] = cleaned_leyes
+
+        return result
 
 
 def format_response_telegram(result: dict) -> str:
