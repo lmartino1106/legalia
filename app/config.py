@@ -26,6 +26,9 @@ class Settings(BaseSettings):
     # LLM
     anthropic_api_key: str = ""
 
+    # Embeddings
+    openai_api_key: str = ""
+
     # Vector DB
     qdrant_url: str = "http://localhost:6333"
     qdrant_api_key: str = ""
