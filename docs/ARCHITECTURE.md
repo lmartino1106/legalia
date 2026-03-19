@@ -65,54 +65,57 @@ Respuesta enviada
 - Detectar consultas fuera de Chile → informar limitación
 - Máximo 3 intercambios sin respuesta útil → ofrecer abogado
 
-### 4. RAG Pipeline
+### 4. Sistema de 3 RAGs
 
-**Ubicación:** `app/rag/`
+> Documentación completa en [`docs/RAG_SYSTEMS.md`](RAG_SYSTEMS.md)
 
-#### 4.1 Ingestion Pipeline (offline)
+LegalIA opera con **3 RAGs independientes** que alimentan al mismo orquestador:
+
 ```
-Fuente legal (BCN/Ley Chile)
-    │
-    ▼
-[Scraper/Extractor]
-    │ extrae texto + metadata
-    ▼
-[Legal Chunker]
-    │ split por artículo/inciso, preserva jerarquía
-    ▼
-[Embeddings]
-    │ Voyage AI o OpenAI
-    ▼
-[Vector Store]
-    │ Qdrant con metadata filtering
-    ▼
-Corpus indexado
+              ┌────────────┼────────────┐
+              ▼            ▼            ▼
+     ┌────────────┐ ┌───────────┐ ┌───────────┐
+     │  RAG Laws  │ │ RAG Docs  │ │RAG Train  │
+     │ Legislación│ │ Libros/PDF│ │ Feedback  │
+     └────────────┘ └───────────┘ └───────────┘
 ```
 
-#### 4.2 Query Pipeline (online)
+#### RAG 1: Laws (Legislación)
+- **Ubicación:** `app/rag/laws/`
+- **Collection:** `chilean_laws` (~50K chunks)
+- **Fuentes:** BCN/Ley Chile, códigos, jurisprudencia, dictámenes
+- **Chunking:** por artículo/inciso con jerarquía legal
+- **Actualización:** cron semanal
+
+#### RAG 2: Documents (Libros/PDFs con OCR)
+- **Ubicación:** `app/rag/documents/`
+- **Collection:** `legal_documents` (~20K chunks, crece)
+- **Fuentes:** libros de derecho, manuales, papers, documentos escaneados
+- **OCR Stack:** Tesseract + Surya + OpenCV + SymSpell
+- **Chunking:** por capítulo/sección, 800-1200 tokens
+- **Actualización:** bajo demanda (upload)
+
+#### RAG 3: Training (Mejora Continua)
+- **Ubicación:** `app/rag/training/`
+- **Collection:** `training_knowledge` (~5K chunks, crece)
+- **Fuentes:** feedback usuarios (👍/👎), correcciones de abogados, patrones de error
+- **Tipos:** Q&A validados, correcciones, patrones de reformulación, anti-patrones
+- **Actualización:** tiempo real
+
+#### Query Pipeline Unificado
 ```
-Pregunta del usuario
-    │
-    ▼
-[Query Rewriter]
-    │ reformula en lenguaje legal
-    ▼
-[Hybrid Search]
-    │ vector similarity + BM25 keyword
-    │ filtro por área legal
-    ▼
-[Reranker]
-    │ Cohere Rerank o cross-encoder
-    │ top-k documentos relevantes
-    ▼
-[LLM (Claude)]
-    │ genera respuesta con citations
-    │ system prompt: orientador legal
-    ▼
-[Citation Validator]
-    │ verifica que artículos citados existen
-    ▼
-Respuesta con citas
+Pregunta → Query Rewriter → Router de RAGs
+                                │
+                    ┌───────────┼───────────┐
+                    ▼           ▼           ▼
+               Laws (5)    Docs (3)   Training (3)
+                    │           │           │
+                    └───────────┼───────────┘
+                                ▼
+                     Merge & Cross-RAG Rerank
+                                │
+                                ▼
+                     LLM (Claude) + Citations
 ```
 
 ### 5. Data Layer
@@ -126,10 +129,15 @@ Respuesta con citas
 - `subscriptions`: planes y billing
 - `referrals`: derivaciones a abogados
 - `analytics_events`: tracking de uso
+- `feedback`: thumbs up/down por mensaje
+- `corrections`: correcciones de abogados
+- `documents`: registro de PDFs/libros cargados
+- `ocr_jobs`: estado de procesamiento OCR
 
-#### Vector Store (Qdrant)
-- Collection: `chilean_law`
-- Metadata: ley, artículo, área, vigencia, fuente
+#### Vector Store (Qdrant) — 3 Collections
+- `chilean_laws`: legislación oficial (ley, artículo, área, vigencia, fuente)
+- `legal_documents`: libros/PDFs (titulo, autor, año, tipo, area, pagina, ocr_score)
+- `training_knowledge`: feedback/correcciones (tipo, area, fecha, score, validado_por)
 - Dimensiones: 1024 (Voyage) o 1536 (OpenAI)
 
 ### 6. Billing
@@ -146,52 +154,85 @@ Respuesta con citas
 ```
 legalia/
 ├── app/
-│   ├── main.py              # FastAPI app entry point
-│   ├── config.py             # Settings y env vars
+│   ├── main.py                  # FastAPI app entry point
+│   ├── config.py                 # Settings y env vars
 │   ├── api/
-│   │   ├── webhooks.py       # WhatsApp webhook endpoints
-│   │   ├── health.py         # Health check
-│   │   └── middleware.py     # Rate limiting, logging
+│   │   ├── webhooks.py           # WhatsApp webhook endpoints
+│   │   ├── health.py             # Health check
+│   │   └── middleware.py         # Rate limiting, logging
 │   ├── agents/
-│   │   ├── orchestrator.py   # Pipeline principal
-│   │   ├── classifier.py     # Clasificador de intención
-│   │   ├── guardrails.py     # Safety checks
-│   │   └── formatter.py      # WhatsApp message formatter
+│   │   ├── orchestrator.py       # Pipeline principal
+│   │   ├── classifier.py         # Clasificador de intención
+│   │   ├── guardrails.py         # Safety checks
+│   │   └── formatter.py          # WhatsApp message formatter
 │   ├── rag/
-│   │   ├── pipeline.py       # Query pipeline completo
-│   │   ├── retriever.py      # Hybrid search
-│   │   ├── reranker.py       # Reranking
-│   │   ├── generator.py      # LLM response generation
-│   │   └── citations.py      # Citation validation
+│   │   ├── router.py             # Decide qué RAGs consultar
+│   │   ├── merger.py             # Merge & rerank cross-RAG
+│   │   ├── generator.py          # LLM response generation
+│   │   ├── citations.py          # Citation validation
+│   │   ├── laws/                 # RAG 1: Legislación
+│   │   │   ├── pipeline.py       # Query pipeline laws
+│   │   │   ├── retriever.py      # Hybrid search laws
+│   │   │   ├── chunker.py        # Legal chunker (art/inciso)
+│   │   │   ├── enricher.py       # Metadata enricher
+│   │   │   └── embedder.py       # Embeddings laws
+│   │   ├── documents/            # RAG 2: Libros/PDFs+OCR
+│   │   │   ├── pipeline.py       # Query pipeline docs
+│   │   │   ├── retriever.py      # Search documents
+│   │   │   ├── detector.py       # Detecta tipo PDF (texto/scan/mixto)
+│   │   │   ├── ocr.py            # OCR engine (Tesseract/Surya)
+│   │   │   ├── preprocessor.py   # Deskew, denoise, binarize
+│   │   │   ├── layout.py         # Layout analysis
+│   │   │   ├── chunker.py        # Doc chunker (cap/sección)
+│   │   │   ├── metadata.py       # Extractor metadata docs
+│   │   │   ├── tables.py         # Extracción de tablas
+│   │   │   └── embedder.py       # Embeddings docs
+│   │   └── training/             # RAG 3: Mejora continua
+│   │       ├── pipeline.py       # Query pipeline training
+│   │       ├── retriever.py      # Search training data
+│   │       ├── collector.py      # Event collector (feedback)
+│   │       ├── processor.py      # Procesa correcciones/feedback
+│   │       ├── analyzer.py       # Quality analyzer (Langfuse)
+│   │       ├── chunker.py        # Training data chunker
+│   │       └── embedder.py       # Embeddings training
 │   ├── whatsapp/
-│   │   ├── client.py         # Twilio WhatsApp client
-│   │   ├── session.py        # Conversation session manager
-│   │   └── templates.py      # Message templates
+│   │   ├── client.py             # Twilio WhatsApp client
+│   │   ├── session.py            # Conversation session manager
+│   │   └── templates.py          # Message templates
 │   ├── billing/
-│   │   ├── plans.py          # Plan definitions
-│   │   ├── tracker.py        # Usage tracking
-│   │   └── payments.py       # MercadoPago/Flow integration
+│   │   ├── plans.py              # Plan definitions
+│   │   ├── tracker.py            # Usage tracking
+│   │   └── payments.py           # MercadoPago/Flow integration
 │   ├── models/
-│   │   ├── user.py           # User model
-│   │   ├── conversation.py   # Conversation model
-│   │   └── subscription.py   # Subscription model
+│   │   ├── user.py               # User model
+│   │   ├── conversation.py       # Conversation model
+│   │   ├── subscription.py       # Subscription model
+│   │   ├── feedback.py           # Feedback model
+│   │   └── document.py           # Document/OCR job model
 │   └── utils/
-│       ├── logging.py        # Structured logging
-│       └── monitoring.py     # Langfuse integration
+│       ├── logging.py            # Structured logging
+│       └── monitoring.py         # Langfuse integration
 ├── scripts/
-│   ├── ingest_laws.py        # Corpus ingestion pipeline
-│   ├── chunk_laws.py         # Legal document chunker
-│   └── seed_db.py            # Database seeding
+│   ├── ingest_laws.py            # Corpus legal ingestion
+│   ├── ingest_books.py           # PDF/book ingestion + OCR
+│   ├── process_feedback.py       # Batch feedback processor
+│   ├── quality_report.py         # Weekly quality report
+│   └── seed_db.py                # Database seeding
 ├── data/
-│   ├── raw/                  # Raw legal documents
-│   ├── processed/            # Chunked documents
-│   └── embeddings/           # Generated embeddings
+│   ├── raw/                      # Raw legal documents
+│   ├── books/                    # PDFs y libros para OCR
+│   ├── processed/                # Chunked documents
+│   ├── feedback/                 # Feedback data exports
+│   ├── training/                 # Training data sets
+│   └── embeddings/               # Generated embeddings
 ├── tests/
 │   ├── unit/
 │   └── integration/
 ├── docs/
-│   ├── ARCHITECTURE.md       # Este archivo
-│   └── API.md                # API documentation
+│   ├── ARCHITECTURE.md           # Este archivo
+│   ├── RAG_SYSTEMS.md            # Detalle de los 3 RAGs
+│   ├── TASKS.md                  # Plan de tareas
+│   └── API.md                    # API documentation
 ├── .env.example
 ├── .gitignore
 ├── README.md
