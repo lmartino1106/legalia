@@ -112,6 +112,40 @@ async def get_or_create_conversation(user_id: str) -> str:
     return result.data[0]["id"]
 
 
+async def get_conversation_history(user_id: str, limit: int = 6) -> list[dict]:
+    """Get recent messages for conversation context."""
+    db = get_supabase()
+
+    # Buscar conversación activa
+    conv_result = (
+        db.table("conversations")
+        .select("id")
+        .eq("user_id", user_id)
+        .eq("status", "active")
+        .order("last_message_at", desc=True)
+        .limit(1)
+        .execute()
+    )
+
+    if not conv_result.data:
+        return []
+
+    conv_id = conv_result.data[0]["id"]
+
+    # Obtener últimos mensajes
+    msg_result = (
+        db.table("messages")
+        .select("role, content")
+        .eq("conversation_id", conv_id)
+        .order("created_at", desc=True)
+        .limit(limit)
+        .execute()
+    )
+
+    # Invertir para orden cronológico
+    return list(reversed(msg_result.data)) if msg_result.data else []
+
+
 async def save_feedback(
     message_id: str,
     user_id: str,

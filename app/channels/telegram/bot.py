@@ -8,9 +8,21 @@ from telegram.ext import (
     filters,
 )
 from app.config import get_settings
-from app.db import get_or_create_user, save_message
+from app.db import get_or_create_user, save_message, get_conversation_history
+from app.agents.orchestrator import LegalOrchestrator, format_response_telegram
 
 logger = logging.getLogger(__name__)
+
+# Instancia global del orquestador
+_orchestrator: LegalOrchestrator | None = None
+
+
+def get_orchestrator() -> LegalOrchestrator:
+    global _orchestrator
+    if _orchestrator is None:
+        _orchestrator = LegalOrchestrator()
+    return _orchestrator
+
 
 # ─── Handlers ────────────────────────────────────────────────
 
@@ -24,14 +36,13 @@ async def start_command(update: Update, context) -> None:
     )
 
     welcome = (
-        f"👋 *Hola {user.first_name}\\!* Soy *LegalIA*, tu orientador legal con IA\\.\n\n"
-        "Puedo ayudarte con consultas sobre legislación chilena:\n\n"
-        "⚖️ Derecho Laboral\n"
-        "🏠 Arriendos y Vivienda\n"
-        "👨‍👩‍👧 Derecho de Familia\n"
-        "📄 Contratos y Civil\n"
-        "🏢 Derecho Comercial\n\n"
-        "Simplemente *escribe tu pregunta* y te respondo\\.\n\n"
+        f"👋 *Hola {_esc(user.first_name or 'ahí')}\\!* Soy *LegalIA*\\.\n\n"
+        "Soy un orientador legal con inteligencia artificial "
+        "especializado en *legislación chilena*\\.\n\n"
+        "Puedo ayudarte con *cualquier área del derecho*:\n"
+        "laboral, familia, penal, consumidor, arriendos, "
+        "tributario, migratorio, comercial, y más\\.\n\n"
+        "Simplemente *escribe tu caso o pregunta* y te oriento\\.\n\n"
         "⚠️ _Esta orientación no reemplaza asesoría profesional\\._"
     )
     await update.message.reply_text(welcome, parse_mode="MarkdownV2")
@@ -40,44 +51,44 @@ async def start_command(update: Update, context) -> None:
 async def help_command(update: Update, context) -> None:
     """Handler para /help."""
     text = (
-        "📋 *Comandos disponibles:*\n\n"
-        "/start \\- Iniciar conversación\n"
-        "/help \\- Ver esta ayuda\n"
-        "/areas \\- Ver áreas legales cubiertas\n"
-        "/plan \\- Ver tu plan actual\n\n"
-        "O simplemente escribe tu consulta legal\\."
+        "📋 *Cómo usar LegalIA:*\n\n"
+        "Escribe tu situación legal y te oriento\\.\n\n"
+        "*Ejemplos de consultas:*\n"
+        "• _Me despidieron sin aviso, ¿qué hago?_\n"
+        "• _Compré algo defectuoso y no me quieren devolver la plata_\n"
+        "• _Mi arrendador no me devuelve la garantía_\n"
+        "• _¿Cómo funciona la pensión alimenticia?_\n"
+        "• _Me chocaron y el otro conductor se fugó_\n\n"
+        "*Comandos:*\n"
+        "/start \\- Reiniciar conversación\n"
+        "/help \\- Esta ayuda\n"
+        "/nuevo \\- Nueva consulta \\(limpia contexto\\)\n"
     )
     await update.message.reply_text(text, parse_mode="MarkdownV2")
 
 
-async def areas_command(update: Update, context) -> None:
-    """Handler para /areas."""
-    keyboard = [
-        [InlineKeyboardButton("⚖️ Laboral", callback_data="area_laboral")],
-        [InlineKeyboardButton("🏠 Vivienda", callback_data="area_vivienda")],
-        [InlineKeyboardButton("👨‍👩‍👧 Familia", callback_data="area_familia")],
-        [InlineKeyboardButton("📄 Civil/Contratos", callback_data="area_civil")],
-        [InlineKeyboardButton("🏢 Comercial", callback_data="area_comercial")],
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
+async def nuevo_command(update: Update, context) -> None:
+    """Limpia el contexto de conversación."""
+    context.user_data.clear()
     await update.message.reply_text(
-        "¿Sobre qué área necesitas orientación?",
-        reply_markup=reply_markup,
+        "🔄 Contexto limpiado\\. Escribe tu nueva consulta\\.",
+        parse_mode="MarkdownV2",
     )
 
 
 async def handle_message(update: Update, context) -> None:
-    """Handler para mensajes de texto (consultas legales)."""
+    """Handler principal — procesa consultas legales con Claude."""
     user = update.effective_user
     text = update.message.text
 
-    # Guardar usuario y mensaje
+    # Guardar usuario
     db_user = await get_or_create_user(
         channel="telegram",
         channel_user_id=str(user.id),
         display_name=user.first_name or "",
     )
 
+    # Guardar mensaje del usuario
     await save_message(
         user_id=db_user["id"],
         role="user",
@@ -85,25 +96,51 @@ async def handle_message(update: Update, context) -> None:
         channel="telegram",
     )
 
-    # TODO: Aquí va el orquestador → RAG pipeline
-    # Por ahora, echo con formato legal
-    response_text = (
-        f"📩 Recibí tu consulta:\n\n"
-        f"_{escape_md(text)}_\n\n"
-        "🔄 *Procesando\\.\\.\\.*\n\n"
-        "⚠️ _El sistema RAG aún no está conectado\\. "
-        "Pronto podré responder con legislación chilena\\._"
-    )
+    # Indicador de "escribiendo..."
+    await update.message.chat.send_action("typing")
 
-    # Enviar respuesta
-    sent = await update.message.reply_text(response_text, parse_mode="MarkdownV2")
+    # Obtener historial para contexto
+    history = await get_conversation_history(db_user["id"], limit=6)
 
-    # Guardar respuesta del bot
+    # Procesar con el orquestador (Claude)
+    settings = get_settings()
+    if not settings.anthropic_api_key:
+        await update.message.reply_text(
+            "⚙️ El sistema está en configuración\\. Pronto podré responder consultas legales\\.",
+            parse_mode="MarkdownV2",
+        )
+        return
+
+    orchestrator = get_orchestrator()
+    result = await orchestrator.process_query(query=text, conversation_history=history)
+
+    # Formatear respuesta para Telegram
+    try:
+        response_text = format_response_telegram(result)
+        sent = await update.message.reply_text(response_text, parse_mode="MarkdownV2")
+    except Exception as e:
+        # Fallback sin markdown si falla el escape
+        logger.warning(f"Error con MarkdownV2, usando plain text: {e}")
+        plain = result.get("respuesta", "Error procesando la consulta.")
+        area = result.get("area_legal", "")
+        leyes = result.get("leyes_relevantes", [])
+
+        fallback = f"⚖️ {area.upper()}\n\n{plain}"
+        if leyes:
+            fallback += "\n\n📌 Normativa:\n" + "\n".join(f"  • {l}" for l in leyes)
+        fallback += "\n\n⚠️ Esta orientación no reemplaza asesoría profesional."
+
+        sent = await update.message.reply_text(fallback)
+
+    # Guardar respuesta en DB
     await save_message(
         user_id=db_user["id"],
         role="assistant",
-        content=response_text,
+        content=result.get("respuesta", ""),
         channel="telegram",
+        area_detected=result.get("area_legal"),
+        confidence_score=0.0,
+        citations=[{"ley": l} for l in result.get("leyes_relevantes", [])],
     )
 
     # Botones de feedback
@@ -112,56 +149,47 @@ async def handle_message(update: Update, context) -> None:
             InlineKeyboardButton("👍 Útil", callback_data=f"fb_pos_{sent.message_id}"),
             InlineKeyboardButton("👎 No útil", callback_data=f"fb_neg_{sent.message_id}"),
         ],
-        [
-            InlineKeyboardButton("👨‍⚖️ Hablar con abogado", callback_data="referral"),
-        ],
     ]
+
+    # Si necesita abogado, agregar botón
+    if result.get("necesita_abogado"):
+        keyboard.append([
+            InlineKeyboardButton("👨‍⚖️ Conectar con abogado", callback_data="referral"),
+        ])
+
     await sent.reply_text(
-        "¿Te fue útil esta respuesta?",
+        "¿Te fue útil?",
         reply_markup=InlineKeyboardMarkup(keyboard),
     )
 
 
 async def handle_callback(update: Update, context) -> None:
-    """Handler para botones inline (feedback, áreas, etc.)."""
+    """Handler para botones inline."""
     query = update.callback_query
     await query.answer()
-
     data = query.data
 
     if data.startswith("fb_pos_"):
-        await query.edit_message_text("✅ ¡Gracias por tu feedback positivo!")
-        # TODO: guardar feedback positivo en DB
+        await query.edit_message_text("✅ ¡Gracias! Tu feedback nos ayuda a mejorar.")
+        # TODO: save_feedback(positive)
     elif data.startswith("fb_neg_"):
         await query.edit_message_text(
-            "📝 Gracias por avisarnos. Vamos a mejorar.\n"
-            "¿Puedes decirnos qué estuvo mal? (escribe tu comentario)"
+            "📝 Gracias por avisarnos. ¿Qué estuvo mal?\n"
+            "Escribe tu comentario y lo usaremos para mejorar."
         )
-        # TODO: guardar feedback negativo en DB
+        # TODO: save_feedback(negative) + flag for review
     elif data == "referral":
         await query.edit_message_text(
-            "👨‍⚖️ Te conectaremos con un abogado especializado.\n"
-            "Pronto recibirás información de contacto."
-        )
-        # TODO: crear referral en DB
-    elif data.startswith("area_"):
-        area = data.replace("area_", "")
-        areas_info = {
-            "laboral": "⚖️ *Derecho Laboral*: despidos, contratos, horas extra, licencias, acoso laboral (Ley Karin), finiquitos.",
-            "vivienda": "🏠 *Vivienda*: arriendos, desahucios, contratos de arriendo, derechos del arrendatario.",
-            "familia": "👨‍👩‍👧 *Familia*: pensión alimenticia, custodia, divorcio, herencias, violencia intrafamiliar.",
-            "civil": "📄 *Civil/Contratos*: contratos, deudas, cobranzas, responsabilidad civil, prescripción.",
-            "comercial": "🏢 *Comercial*: sociedades, SPA, marcas, PYMES, tributario básico.",
-        }
-        text = areas_info.get(area, "Área no reconocida.")
-        await query.edit_message_text(
-            f"{text}\n\nEscribe tu pregunta sobre este tema.",
-            parse_mode="Markdown",
+            "👨‍⚖️ Derivación a abogado\n\n"
+            "Pronto implementaremos la conexión con abogados "
+            "especializados en tu área. Por ahora, te recomendamos "
+            "buscar en el registro de abogados del Colegio de Abogados "
+            "o consultar en tu CAJ (Corporación de Asistencia Judicial) más cercana."
         )
 
 
-def escape_md(text: str) -> str:
-    """Escapa caracteres especiales para MarkdownV2."""
+def _esc(text: str) -> str:
+    """Escapa caracteres para Telegram MarkdownV2."""
     special = r"_*[]()~`>#+-=|{}.!"
     for ch in special:
         text = text.replace(ch, f"\\{ch}")
@@ -175,15 +203,10 @@ def create_bot() -> Application:
     settings = get_settings()
     app = Application.builder().token(settings.telegram_bot_token).build()
 
-    # Comandos
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(CommandHandler("areas", areas_command))
-
-    # Mensajes de texto (consultas)
+    app.add_handler(CommandHandler("nuevo", nuevo_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
-    # Callbacks de botones inline
     app.add_handler(CallbackQueryHandler(handle_callback))
 
     logger.info("Bot de Telegram configurado: @legalia_cl_bot")
