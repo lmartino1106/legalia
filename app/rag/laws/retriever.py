@@ -256,16 +256,18 @@ async def search_laws(query: str, area: str | None = None, top_k: int = 5) -> li
                 must=[FieldCondition(key="area", match=MatchValue(value=area))]
             )
 
-        vector_results_raw = qclient.search(
+        from qdrant_client.models import models
+
+        vector_results_raw = qclient.query_points(
             collection_name="chilean_laws",
-            query_vector=query_vector,
+            query=query_vector,
             query_filter=query_filter,
             limit=top_k + 3,  # Más candidatos para fusión
             with_payload=True,
         )
 
         vector_results = []
-        for hit in vector_results_raw:
+        for hit in vector_results_raw.points:
             vector_results.append({
                 "text": hit.payload.get("text", ""),
                 "law_name": hit.payload.get("law_name", ""),
