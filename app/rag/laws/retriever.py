@@ -256,8 +256,6 @@ async def search_laws(query: str, area: str | None = None, top_k: int = 5) -> li
                 must=[FieldCondition(key="area", match=MatchValue(value=area))]
             )
 
-        from qdrant_client.models import models
-
         vector_results_raw = qclient.query_points(
             collection_name="chilean_laws",
             query=query_vector,
